@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package rocksdb;
+
+option go_package = "rocksdb-server/proto/rocksdb";
+
+// Service definition
+service RocksDBService {
+  rpc Put          (PutRequest)           returns (Response);
+  rpc Get          (GetRequest)           returns (GetResponse);
+  rpc Delete       (DeleteRequest)        returns (Response);
+  rpc BatchPut     (BatchPutRequest)      returns (Response);
+  rpc Scan         (ScanRequest)          returns (ScanResponse);
+  rpc ScanPaginated(ScanPaginatedRequest) returns (ScanPaginatedResponse);
+  rpc RangeQuery   (RangeQueryRequest)    returns (RangeQueryResponse);
+  rpc Ping         (PingRequest)          returns (Response);
+  rpc Health       (HealthRequest)        returns (Response);
+}
+
+// Requests and responses
+message PutRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message BatchPutRequest {
+  repeated PutRequest items = 1;
+}
+
+message GetRequest {
+  string key        = 1;
+  string ref_id     = 2;
+  string start_time = 3;
+  string end_time   = 4;
+}
+
+message GetResponse {
+  string status  = 1;
+  string message = 2;
+  string value   = 3;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message Response {
+  string status  = 1;
+  string message = 2;
+  string value   = 3;
+}
+
+message ScanRequest {}
+
+message ScanResponse {
+  map<string, string> data = 1;
+  int32 count             = 2;
+}
+
+message ScanPaginatedRequest {
+  int32 limit  = 1;
+  string cursor = 2;
+}
+
+message ScanPaginatedResponse {
+  map<string, string> data = 1;
+  string next_cursor       = 2;
+  bool has_more            = 3;
+  int32 count              = 4;
+}
+
+message RangeQueryRequest {
+  string ref_id     = 1;
+  string start_time = 2;
+  string end_time   = 3;
+}
+
+message RangeQueryResponse {
+  repeated Metadata results = 1;
+  int32 count               = 2;
+}
+
+message Metadata {
+  string ref_id     = 1;
+  string s3_path    = 2;
+  int64  start_byte = 3;
+  int64  end_byte   = 4;
+  int64  timestamp  = 5;
+}
+
+message PingRequest {}
+
+message HealthRequest {}
