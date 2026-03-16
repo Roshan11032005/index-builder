@@ -17,10 +17,10 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/cespare/xxhash/v2"
 
 	"index-builder/config"
 	"index-builder/internal/cursor"
+	"index-builder/internal/ring"
 	"index-builder/internal/s3store"
 	"index-builder/internal/shard"
 	"index-builder/internal/sst"
@@ -73,6 +73,7 @@ type Metrics struct {
 type IndexBuilder struct {
 	cfg       *config.Config
 	shards    *shard.Pool
+	ring      *ring.Ring          // consistent hash ring for shard routing
 	s3clients map[string]*s3store.Client // keyed by bucket name
 	cur       *cursor.Manager
 	Metrics   Metrics
@@ -88,15 +89,47 @@ func New(
 	s3clients map[string]*s3store.Client,
 	cur *cursor.Manager,
 ) *IndexBuilder {
+	// Build the initial ring from the shard IDs declared in config.
+	shardIDs := make([]int, len(cfg.Shards))
+	for i, s := range cfg.Shards {
+		shardIDs[i] = s.ID
+	}
+	r := ring.New(shardIDs, 0) // 0 → ring.DefaultVNodes (150) virtual nodes each
+	log.Printf("[builder] consistent ring initialised: %d shard(s), %d virtual nodes each",
+		r.Len(), ring.DefaultVNodes)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	return &IndexBuilder{
 		cfg:       cfg,
 		shards:    shards,
+		ring:      r,
 		s3clients: s3clients,
 		cur:       cur,
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+}
+
+// AddShard adds a shard to the live ring so new writes are routed to it.
+// The caller is responsible for starting the corresponding shard.Pool entry
+// and triggering a re-balance of existing data if required.
+func (b *IndexBuilder) AddShard(shardID int) error {
+	if err := b.ring.AddShard(shardID); err != nil {
+		return err
+	}
+	log.Printf("[builder] shard %d added to ring (%d total)", shardID, b.ring.Len())
+	return nil
+}
+
+// RemoveShard removes a shard from the live ring.
+// Keys previously owned by this shard are automatically re-routed to the
+// next clockwise neighbour; no re-hashing of the whole dataset is needed.
+func (b *IndexBuilder) RemoveShard(shardID int) error {
+	if err := b.ring.RemoveShard(shardID); err != nil {
+		return err
+	}
+	log.Printf("[builder] shard %d removed from ring (%d remaining)", shardID, b.ring.Len())
+	return nil
 }
 
 // Start launches background goroutines. Call Stop to shut down gracefully.
@@ -337,7 +370,7 @@ func (b *IndexBuilder) processSegment(seg segmentFile) error {
 // ─── RocksDB writes via gRPC ─────────────────────────────────────────────────
 
 func (b *IndexBuilder) writeToShards(entries []sst.Entry) error {
-	// Group entries by shard — hash only the ref:REF_ID portion for consistency.
+	// Group entries by shard using the consistent ring.
 	buckets := make(map[int][]shard.KV)
 	for _, e := range entries {
 		id := b.shardFor(e.Key)
@@ -372,16 +405,22 @@ func (b *IndexBuilder) writeToShards(entries []sst.Entry) error {
 	return nil
 }
 
-// shardFor returns the shard index for a RocksDB key.
-// It hashes only the "ref:REF_ID" prefix so all events for the same reference
-// land on the same shard.
+// shardFor returns the shard ID responsible for a RocksDB key.
+//
+// The ring hashes only the "ref:REF_ID" prefix of the key so that all events
+// for the same reference always land on the same shard — identical to the
+// previous behaviour, but now using consistent hashing instead of modulo.
+// This means adding or removing a shard only re-routes the ~1/N slice of keys
+// that sat between the affected shard's virtual nodes and their neighbours;
+// all other keys are undisturbed.
 func (b *IndexBuilder) shardFor(key string) int {
-	parts := strings.SplitN(key, ":", 3) // ["ref", "REF_ID", ...]
+	// Extract "ref:REF_ID" so every event for the same reference hashes the
+	// same way, regardless of its timestamp or eventID suffix.
 	hashKey := key
-	if len(parts) >= 2 && parts[0] == "ref" {
+	if parts := strings.SplitN(key, ":", 3); len(parts) >= 2 && parts[0] == "ref" {
 		hashKey = parts[0] + ":" + parts[1]
 	}
-	return int(xxhash.Sum64String(hashKey) % uint64(b.shards.Len()))
+	return b.ring.Get(hashKey)
 }
 
 // ─── SST upload ───────────────────────────────────────────────────────────────
@@ -626,7 +665,3 @@ func parseTimestamp(s string) (int64, error) {
 	}
 	return 0, fmt.Errorf("cannot parse timestamp %q", s)
 }
-
-
-
-// ensure unused imports don't cause compile errors in this file

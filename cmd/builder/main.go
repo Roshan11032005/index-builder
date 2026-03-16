@@ -37,9 +37,9 @@ func main() {
 	}
 
 	// ── Shard pool (gRPC connections) ──────────────────────────────────────────
-	addrs := make([]string, len(cfg.Shards))
-	for i, s := range cfg.Shards {
-		addrs[i] = s.URL
+	addrs := make(map[int]string, len(cfg.Shards))
+	for _, s := range cfg.Shards {
+		addrs[s.ID] = s.URL
 	}
 	pool, err := shard.NewPool(addrs)
 	if err != nil {
