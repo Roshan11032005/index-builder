@@ -47,6 +47,10 @@ type Config struct {
 	SSTTempDir           string
 	PollInterval         time.Duration
 
+	// Parallelism / batching
+	SegmentConcurrency int // max segments processed in parallel
+	CursorBatchSize    int // persist cursor every N segments
+
 	// Operational HTTP server (metrics / health / force-compact)
 	HTTPPort string
 }
@@ -74,6 +78,8 @@ func Load() (*Config, error) {
 		CompactionMaxAge:     envDuration("COMPACTION_MAX_AGE", 24*time.Hour),
 		SSTTempDir:           envStr("SST_TEMP_DIR", "./tmp/sst"),
 		PollInterval:         envDuration("POLL_INTERVAL", 10*time.Second),
+		SegmentConcurrency:   envInt("SEGMENT_CONCURRENCY", 8),
+		CursorBatchSize:      envInt("CURSOR_BATCH_SIZE", 20),
 		HTTPPort:             envStr("HTTP_PORT", "8086"),
 	}
 

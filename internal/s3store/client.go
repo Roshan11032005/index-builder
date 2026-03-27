@@ -147,11 +147,23 @@ func (c *Client) DeleteMany(ctx context.Context, keys []string) error {
 
 // ListWithPrefix returns all object keys under the given prefix.
 func (c *Client) ListWithPrefix(ctx context.Context, prefix string) ([]types.Object, error) {
-	var out []types.Object
-	pager := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+	return c.ListWithPrefixAfter(ctx, prefix, "")
+}
+
+// ListWithPrefixAfter returns objects under prefix whose keys are
+// lexicographically after startAfter. This avoids scanning already-processed
+// objects and is critical for buckets with millions of keys.
+func (c *Client) ListWithPrefixAfter(ctx context.Context, prefix, startAfter string) ([]types.Object, error) {
+	input := &s3.ListObjectsV2Input{
 		Bucket: aws.String(c.bucket),
 		Prefix: aws.String(prefix),
-	})
+	}
+	if startAfter != "" {
+		input.StartAfter = aws.String(startAfter)
+	}
+
+	var out []types.Object
+	pager := s3.NewListObjectsV2Paginator(c.s3, input)
 	for pager.HasMorePages() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {

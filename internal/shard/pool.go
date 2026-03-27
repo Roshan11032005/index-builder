@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 
 	pb "index-builder/proto/rocksdb"
 )
@@ -50,11 +52,14 @@ func NewPool(addrs map[int]string) (*Pool, error) {
 // dial opens one gRPC connection for shardID and stores it.
 // The caller must hold mu (write) or be in a single-goroutine context (NewPool).
 func (p *Pool) dial(shardID int, addr string) error {
-	// Do not use grpc.WithBlock() — connections are established lazily on the
-	// first RPC call. Each call site already carries its own context deadline,
-	// so a blocking dial here only delays startup and masks real errors.
 	conn, err := grpc.Dial(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64<<20), grpc.MaxCallSendMsgSize(64<<20)),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
 	)
 	if err != nil {
 		return fmt.Errorf("shard %d (%s): dial: %w", shardID, addr, err)
@@ -191,7 +196,9 @@ func (p *Pool) Put(ctx context.Context, shardID int, key, value string) error {
 	return err
 }
 
-// BatchPut writes a batch of key-value pairs to the given shard atomically.
+// BatchPut writes a batch of key-value pairs to the given shard.
+// Large batches are automatically chunked to avoid exceeding gRPC message
+// size limits (~4 MB default) and to keep individual RPCs fast.
 func (p *Pool) BatchPut(ctx context.Context, shardID int, pairs []KV) error {
 	if len(pairs) == 0 {
 		return nil
@@ -201,12 +208,24 @@ func (p *Pool) BatchPut(ctx context.Context, shardID int, pairs []KV) error {
 		return err
 	}
 
-	items := make([]*pb.PutRequest, len(pairs))
-	for i, kv := range pairs {
-		items[i] = &pb.PutRequest{Key: kv.Key, Value: kv.Value}
+	const maxChunkSize = 5000 // ~5k KVs per RPC, well within 4 MB
+
+	for i := 0; i < len(pairs); i += maxChunkSize {
+		end := i + maxChunkSize
+		if end > len(pairs) {
+			end = len(pairs)
+		}
+		chunk := pairs[i:end]
+
+		items := make([]*pb.PutRequest, len(chunk))
+		for j, kv := range chunk {
+			items[j] = &pb.PutRequest{Key: kv.Key, Value: kv.Value}
+		}
+		if _, err := c.BatchPut(ctx, &pb.BatchPutRequest{Items: items}); err != nil {
+			return fmt.Errorf("chunk %d–%d: %w", i, end, err)
+		}
 	}
-	_, err = c.BatchPut(ctx, &pb.BatchPutRequest{Items: items})
-	return err
+	return nil
 }
 
 // Get retrieves a single key from the given shard.

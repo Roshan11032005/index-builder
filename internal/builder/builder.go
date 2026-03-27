@@ -35,6 +35,14 @@ type event struct {
 	payload     string // pre-formatted RocksDB value
 }
 
+// eventJSON is a typed struct for fast JSON decoding — avoids the
+// reflection and allocation overhead of map[string]any.
+type eventJSON struct {
+	EventID        string `json:"_event_id"`
+	ReferenceID    string `json:"reference_id"`
+	EventTimestamp string `json:"_event_timestamp"`
+}
+
 type segmentFile struct {
 	bucket    string
 	objectKey string
@@ -213,16 +221,51 @@ func (b *IndexBuilder) runIndexing() {
 
 	log.Printf("[builder] processing %d segment(s)", len(all))
 
-	for _, seg := range all {
-		if err := b.processSegment(seg); err != nil {
-			log.Printf("[builder] %s/%s: %v — stopping this cycle", seg.bucket, seg.objectKey, err)
+	// Process segments in parallel batches for throughput. We use bounded
+	// concurrency to avoid overwhelming S3/gRPC. Within each batch, segments
+	// are processed concurrently; between batches the cursor is advanced to
+	// the last segment in the batch, preserving at-least-once semantics.
+	segmentConcurrency := b.cfg.SegmentConcurrency
+	cursorBatchSize := b.cfg.CursorBatchSize
+
+	for i := 0; i < len(all); i += cursorBatchSize {
+		end := i + cursorBatchSize
+		if end > len(all) {
+			end = len(all)
+		}
+		batch := all[i:end]
+
+		// Process batch concurrently with bounded parallelism.
+		sem := make(chan struct{}, segmentConcurrency)
+		var batchErr atomic.Value
+		var wg sync.WaitGroup
+
+		for _, seg := range batch {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(s segmentFile) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if err := b.processSegment(s); err != nil {
+					batchErr.Store(err)
+					log.Printf("[builder] %s/%s: %v", s.bucket, s.objectKey, err)
+				}
+				b.Metrics.SegmentsProcessed.Add(1)
+			}(seg)
+		}
+		wg.Wait()
+
+		if v := batchErr.Load(); v != nil {
+			log.Printf("[builder] batch error: %v — stopping this cycle", v)
 			return
 		}
-		if err := b.cur.Advance(b.ctx, seg.bucket, seg.objectKey); err != nil {
+
+		// Advance cursor to the last segment in the batch.
+		lastSeg := batch[len(batch)-1]
+		if err := b.cur.Advance(b.ctx, lastSeg.bucket, lastSeg.objectKey); err != nil {
 			log.Printf("[builder] CRITICAL: cursor save failed: %v — stopping", err)
 			return
 		}
-		b.Metrics.SegmentsProcessed.Add(1)
 	}
 }
 
@@ -230,7 +273,9 @@ func (b *IndexBuilder) listNewSegments(bucketName string) ([]segmentFile, error)
 	cli := b.s3clients[bucketName]
 	lastProcessed := b.cur.Get(bucketName)
 
-	objects, err := cli.ListWithPrefix(b.ctx, "events/")
+	// Use StartAfter to skip already-processed keys at the S3 API level,
+	// avoiding loading millions of old objects into memory.
+	objects, err := cli.ListWithPrefixAfter(b.ctx, "events/", lastProcessed)
 	if err != nil {
 		return nil, err
 	}
@@ -239,9 +284,6 @@ func (b *IndexBuilder) listNewSegments(bucketName string) ([]segmentFile, error)
 	for _, obj := range objects {
 		key := aws.ToString(obj.Key)
 		if !strings.HasSuffix(key, ".ndjson") {
-			continue
-		}
-		if lastProcessed != "" && key <= lastProcessed {
 			continue
 		}
 		ts, writerID, segID, err := parseSegmentPath(key)
@@ -290,7 +332,8 @@ func (b *IndexBuilder) processSegment(seg segmentFile) error {
 	}
 	defer body.Close()
 
-	var events []event
+	// Pre-allocate with estimated capacity to reduce slice growing.
+	events := make([]event, 0, seg.size/256)
 	startByte := int64(0)
 
 	scanner := bufio.NewScanner(body)
@@ -305,23 +348,21 @@ func (b *IndexBuilder) processSegment(seg segmentFile) error {
 			continue
 		}
 
-		var raw map[string]any
+		var raw eventJSON
 		if err := json.Unmarshal(line, &raw); err != nil {
 			log.Printf("[builder] skipping malformed line in %s: %v", seg.objectKey, err)
 			startByte += lineLen + 1
 			continue
 		}
 
-		eventID := strField(raw, "_event_id")
-		refID := strField(raw, "reference_id")
-		if eventID == "" || refID == "" {
+		if raw.EventID == "" || raw.ReferenceID == "" {
 			startByte += lineLen + 1
 			continue
 		}
 
 		ts := seg.timestamp
-		if tsStr := strField(raw, "_event_timestamp"); tsStr != "" {
-			if parsed, err := parseTimestamp(tsStr); err == nil {
+		if raw.EventTimestamp != "" {
+			if parsed, err := parseTimestamp(raw.EventTimestamp); err == nil {
 				ts = parsed
 			}
 		}
@@ -330,8 +371,8 @@ func (b *IndexBuilder) processSegment(seg segmentFile) error {
 		value := fmt.Sprintf("%s|%s|%d|%d", seg.bucket, seg.objectKey, startByte, endByte)
 
 		events = append(events, event{
-			eventID:     eventID,
-			referenceID: refID,
+			eventID:     raw.EventID,
+			referenceID: raw.ReferenceID,
 			timestamp:   ts,
 			payload:     value,
 		})
@@ -384,7 +425,7 @@ func (b *IndexBuilder) writeToShards(entries []sst.Entry) error {
 		wg.Add(1)
 		go func(id int, pairs []shard.KV) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(b.ctx, 10*time.Second)
+			ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
 			defer cancel()
 			if err := b.shards.BatchPut(ctx, id, pairs); err != nil {
 				errCh <- fmt.Errorf("shard %d batch_put: %w", id, err)
